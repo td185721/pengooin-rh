@@ -2,7 +2,7 @@
 -- Tries every common http + loadstring shape so it survives all major
 -- executors (Synapse X, Fluxus, KRNL, Wave, Codex, Delta, Xeno, etc.).
 
-local URL = "https://raw.githubusercontent.com/td185721/pengooin-rh/main/RoyalHighDiamondFarm.lua"
+local URL = "https://raw.githubusercontent.com/td185721/pengooin-rh/main/RoyalHighDiamondFarm.lua?t=" .. tostring(tick())
 
 local function fetch(url)
     -- Try each HTTP entry point in the order most executors expose them.
