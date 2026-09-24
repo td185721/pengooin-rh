@@ -235,20 +235,107 @@ local function returnBooksTick()
 end
 
 ------------------------------------------------------------------------
--- Auto Join Class — the confirmation dialog fires ClassroomDoorGui:FireServer()
+-- Auto Join Class
+--
+-- ScheduleLocalScript wires MouseButton1Click on
+--   PlayerGui.RH4Classes.AnnouncementFrame.AnnouncementSlide.Container.TeleportFrame.TeleportButton
+-- and the click ultimately fires ReplicatedStorage.RH4ScheduleRemote.GoClicked
+-- to the server. We watch the TeleportFrame Visible property and fire both:
+-- firesignal on the button (mimics a real click, running any UI transitions)
+-- and GoClicked as a redundant safety.
 ------------------------------------------------------------------------
-local ClassroomDoorGui = ReplicatedStorage:WaitForChild("ClassroomDoorGui", 10)
+local RH4ScheduleRemote  = ReplicatedStorage:WaitForChild("RH4ScheduleRemote", 10)
 
+local function getAnnounceTeleportFrame()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local rh4 = pg:FindFirstChild("RH4Classes")
+    if not rh4 then return nil end
+    local af = rh4:FindFirstChild("AnnouncementFrame")
+    if not af then return nil end
+    local slide = af:FindFirstChild("AnnouncementSlide")
+    if not slide then return nil end
+    local container = slide:FindFirstChild("Container")
+    if not container then return nil end
+    return container:FindFirstChild("TeleportFrame")
+end
+
+local function fireGoClicked()
+    if RH4ScheduleRemote and RH4ScheduleRemote:FindFirstChild("GoClicked") then
+        pcall(function() RH4ScheduleRemote.GoClicked:FireServer() end)
+    end
+end
+
+local function joinClassNow()
+    local tf = getAnnounceTeleportFrame()
+    if not tf then fireGoClicked(); return end
+    local btn = tf:FindFirstChild("TeleportButton")
+    if btn and btn:IsA("GuiButton") then
+        -- fire every wired connection on the click signal; matches a real press
+        pcall(function() firesignal(btn.MouseButton1Click) end)
+        pcall(function() firesignal(btn.Activated, {}) end)
+    end
+    -- always send the remote as a safety net (game accepts it idempotently
+    -- when a class is about to start; ignored otherwise)
+    fireGoClicked()
+end
+
+local autoJoinBound = false
 local function bindAutoJoin()
-    if not ClassroomDoorGui then return end
-    track(ClassroomDoorGui.OnClientEvent:Connect(function(visible)
-        if visible and State.AutoJoinClass then
-            task.wait(0.3)
-            pcall(function()
-                ClassroomDoorGui:FireServer()
-            end)
+    if autoJoinBound then return end
+    autoJoinBound = true
+
+    -- watcher: polls AnnouncementFrame.AnnouncementSlide.Container.TeleportFrame
+    -- for visibility. This dodges the fact that the frame is destroyed/rebuilt
+    -- across classes (so :GetPropertyChangedSignal doesn't survive).
+    local lastVisible = false
+    newLoop("autojoin", 0.5, function()
+        if not State.AutoJoinClass then lastVisible = false; return end
+        local tf = getAnnounceTeleportFrame()
+        if not tf then return end
+        local vis = tf.Visible
+        if vis and not lastVisible then
+            task.wait(0.4)
+            joinClassNow()
         end
-    end))
+        lastVisible = vis
+    end)
+
+    -- also listen for the scheduler transition signals — cheap, per-class fire
+    if RH4ScheduleRemote then
+        local trans = RH4ScheduleRemote:FindFirstChild("Transition")
+        if trans then
+            track(trans.OnClientEvent:Connect(function(...)
+                if State.AutoJoinClass then
+                    task.wait(0.8)
+                    joinClassNow()
+                end
+            end))
+        end
+        local cn = RH4ScheduleRemote:FindFirstChild("SetClassName")
+        if cn then
+            track(cn.OnClientEvent:Connect(function(...)
+                if State.AutoJoinClass then
+                    task.wait(0.5)
+                    joinClassNow()
+                end
+            end))
+        end
+    end
+end
+
+local function setGameAutoJoinPref(pref)
+    if not RH4ScheduleRemote then return false, "no schedule remote" end
+    local rem = RH4ScheduleRemote:FindFirstChild("SetJoinPref")
+    if not rem then return false, "no SetJoinPref" end
+    local ok, err = pcall(function() rem:FireServer(pref) end)
+    return ok, err
+end
+
+local function fireToolBonus()
+    if not RH4ScheduleRemote then return end
+    local tb = RH4ScheduleRemote:FindFirstChild("ToolBonus")
+    if tb then pcall(function() tb:FireServer(true) end) end
 end
 
 ------------------------------------------------------------------------
@@ -296,6 +383,47 @@ ClassHandlers.SecretDoor = function()
     local ev = ReplicatedStorage:FindFirstChild("MainCampusSecretEvents", true)
     if ev and ev:FindFirstChild("Submit") then
         pcall(function() ev.Submit:FireServer(true) end)
+    end
+end
+
+-- Tool Bonus — some classes give bonus diamonds when you're holding the
+-- matching tool (e.g. potions in potionology). Firing this idempotently is
+-- accepted by the server; it verifies backpack contents itself.
+ClassHandlers.ToolBonus = function()
+    fireToolBonus()
+end
+
+-- Study Hall — StudyHallRemote is a RemoteFunction that grades your session.
+-- Invoking it with no args typically returns the current grade snapshot; the
+-- server side pays out based on server-tracked read time.
+ClassHandlers.StudyHall = function()
+    local rem = ReplicatedStorage:FindFirstChild("StudyHallRemote")
+    if not rem then return end
+    pcall(function()
+        if rem:IsA("RemoteFunction") then rem:InvokeServer("GetGrade")
+        else rem:FireServer("GetGrade") end
+    end)
+end
+
+-- Telescope — grants a diamond bonus for "Rainbow Star" combo picks.
+ClassHandlers.Telescope = function()
+    local rem = ReplicatedStorage:FindFirstChild("TelescopeGameRemote")
+    if not rem then return end
+    pcall(function() rem:FireServer("GotRainbowStar") end)
+end
+
+-- Book Check quest — mirrors LostBooks pattern for the book-check period.
+ClassHandlers.BookCheck = function()
+    local folder = Workspace:FindFirstChild("BookCheckBooks") or Workspace:FindFirstChild("ActiveBookCheck")
+    if not folder then return end
+    local remote = ReplicatedStorage:FindFirstChild("BookCheckRemote", true)
+        or (Workspace:FindFirstChild("BookCheckServer") and Workspace.BookCheckServer:FindFirstChild("BookCheckRemote"))
+    if not remote then return end
+    for _, b in ipairs(folder:GetChildren()) do
+        if b:IsA("BasePart") then
+            pcall(function() remote:FireServer("Get", b.Name) end)
+            task.wait(0.15)
+        end
     end
 end
 
@@ -448,15 +576,31 @@ local ClassBoxR = Tabs.Class:AddRightGroupbox("Notes")
 ClassBoxL:AddToggle("AutoJoinClass", {
     Text = "Auto-join Classes",
     Default = false,
-    Tooltip = "Automatically accepts the classroom door confirmation when it appears (fires ClassroomDoorGui:FireServer()).",
+    Tooltip = "Watches RH4Classes.AnnouncementFrame.AnnouncementSlide.Container.TeleportFrame and fires the TeleportButton + RH4ScheduleRemote.GoClicked when a class prompt appears.",
 }):OnChanged(function(v)
     State.AutoJoinClass = v
 end)
 
+ClassBoxL:AddButton({
+    Text = "Enable in-game Auto-Join (persistent)",
+    Func = function()
+        local ok, err = setGameAutoJoinPref("On")
+        if ok then Library:Notify("Auto-Join set to On") else Library:Notify("Failed: " .. tostring(err)) end
+    end,
+})
+
+ClassBoxL:AddButton({
+    Text = "Join Current Class Now",
+    Func = function()
+        joinClassNow()
+        Library:Notify("Sent join request")
+    end,
+})
+
 ClassBoxL:AddToggle("AutoClassMinigame", {
     Text = "Auto-play Class Minigames",
     Default = false,
-    Tooltip = "Best-effort automation of known class minigames: Stamping, Flight rings, Secret Brick Door, Attic Keys. Only fires when the corresponding class objects exist in workspace.",
+    Tooltip = "Best-effort automation: Stamping, Flight rings, Secret Brick Door, Attic Keys, Study Hall grade, Telescope combo, Book Check, plus per-class Tool Bonus fires.",
 }):OnChanged(function(v)
     State.AutoClassMinigame = v
     if v then
@@ -466,9 +610,12 @@ ClassBoxL:AddToggle("AutoClassMinigame", {
     end
 end)
 
-ClassBoxR:AddLabel("Classes reward diamonds when finished. Enable Auto-join + Auto-play for hands-off farming during the class period.")
-ClassBoxR:AddLabel("Diamonds/Books cap per period is server-enforced (~10 diamonds & book cap).")
-ClassBoxR:AddLabel("Fountain wish (dorm) rewards diamonds once per in-game day — do it manually to avoid the story cutscene edge cases.")
+ClassBoxR:AddLabel("Auto-join fires when the class announcement popup appears.")
+ClassBoxR:AddLabel("The persistent button sets RH4ScheduleRemote.SetJoinPref = 'On'")
+ClassBoxR:AddLabel("(matches the schedule bell's toggle) so the game handles it.")
+ClassBoxR:AddDivider()
+ClassBoxR:AddLabel("Diamonds/Books cap per period is server-enforced (~10 diamonds).")
+ClassBoxR:AddLabel("Fountain wish (dorm): manual — story cutscene has edge cases.")
 
 -- Utility tab ------------------------------------------------------------
 local UtilL = Tabs.Utility:AddLeftGroupbox("Movement")
