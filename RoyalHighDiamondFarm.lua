@@ -660,8 +660,9 @@ local function installClassAutoplayHooks()
         track(det.OnClientEvent:Connect(function(action, ...)
             if not minigameGate() then return end
             if type(action) == "string" and action:lower():find("beat") then
+                local args = {...}
                 RunService.Heartbeat:Wait()
-                pcall(function() det:FireServer("Beats", ...) end)
+                pcall(function() det:FireServer("Beats", unpack(args)) end)
             end
         end))
     end
