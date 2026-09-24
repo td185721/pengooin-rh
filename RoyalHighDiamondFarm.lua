@@ -117,6 +117,7 @@ local State = {
     AutoReturnBooks     = false,
     AutoJoinClass       = false,
     AutoClassMinigame   = false,
+    PauseFarmDuringClass= true,    -- don't hop to diamonds while a class is running
     WalkSpeed           = 16,
     JumpPower           = 50,
     InfiniteJump        = false,
@@ -124,7 +125,58 @@ local State = {
     NoclipDiamonds      = false,   -- for pickup only, temporary during hop
     DiamondsCollected   = 0,
     BooksCollected      = 0,
+    ClassesJoined       = 0,
+    ClassesAced         = 0,
 }
+
+------------------------------------------------------------------------
+-- Class period tracker — one authoritative record per class window.
+-- Everything class-related (join, ace, farm-pause, end-detection) reads
+-- from this. Started by SetClassName or by the announcement fallback,
+-- ended by another SetClassName, an explicit end signal, or the max-
+-- duration safety cap.
+------------------------------------------------------------------------
+local ClassPeriod = {
+    id          = 0,
+    active      = false,
+    joined      = false,      -- true once we've fired the join for THIS period
+    name        = nil,
+    startedAt   = 0,
+    joinedAt    = 0,
+    maxDuration = 360,        -- 6 min hard cap — RH class window is ~5 min
+}
+
+local function endClassPeriod()
+    if ClassPeriod.active then
+        ClassPeriod.active = false
+        ClassPeriod.joined = false
+        ClassPeriod.name   = nil
+    end
+end
+
+local function isInClassPeriod()
+    if not ClassPeriod.active then return false end
+    if (tick() - ClassPeriod.startedAt) > ClassPeriod.maxDuration then
+        endClassPeriod()
+        return false
+    end
+    return true
+end
+
+local function beginClassPeriod(name)
+    ClassPeriod.id        = ClassPeriod.id + 1
+    ClassPeriod.active    = true
+    ClassPeriod.joined    = false
+    ClassPeriod.name      = name or ("class-" .. ClassPeriod.id)
+    ClassPeriod.startedAt = tick()
+    ClassPeriod.joinedAt  = 0
+end
+
+-- farm pause helper — used by every hop-loop that would drag the character
+-- out of the classroom mid-lesson.
+local function farmBlockedByClass()
+    return State.PauseFarmDuringClass and isInClassPeriod() and ClassPeriod.joined
+end
 
 ------------------------------------------------------------------------
 -- safe character teleport — respects the >750 stud/frame anticheat gate
@@ -158,12 +210,14 @@ local function getCollectibleDiamonds()
 end
 
 local function diamondFarmTick()
+    if farmBlockedByClass() then return end
     local folder = getCollectibleDiamonds()
     if not folder then return end
     local hum = humanoid()
     if not hum or hum.Health <= 0 then return end
     for _, d in ipairs(folder:GetChildren()) do
         if not State.AutoCollectDiamonds then break end
+        if farmBlockedByClass() then break end
         if d:IsA("BasePart") and d.Parent == folder then
             local pos = d.Position
             local start = hrp() and hrp().Position
@@ -187,11 +241,13 @@ local function getLostBooksRemote()
 end
 
 local function bookFarmTick()
+    if farmBlockedByClass() then return end
     local folder = Workspace:FindFirstChild("ActiveLostBooks")
     local remote = getLostBooksRemote()
     if not folder or not remote then return end
     for _, b in ipairs(folder:GetChildren()) do
         if not State.AutoCollectBooks then break end
+        if farmBlockedByClass() then break end
         if b:IsA("BasePart") and b.Transparency < 0.9 then
             -- match the vanilla client's fire signature exactly
             local ok = pcall(function()
@@ -207,6 +263,7 @@ local function bookFarmTick()
 end
 
 local function returnBooksTick()
+    if farmBlockedByClass() then return end
     local returnPart = Workspace:FindFirstChild("LostBooksReturn")
     if not returnPart then return end
     local prompt = returnPart:FindFirstChildOfClass("ProximityPrompt")
@@ -266,17 +323,32 @@ local function fireGoClicked()
     end
 end
 
-local function joinClassNow()
-    local tf = getAnnounceTeleportFrame()
-    if not tf then fireGoClicked(); return end
-    local btn = tf:FindFirstChild("TeleportButton")
-    if btn and btn:IsA("GuiButton") then
-        -- fire every wired connection on the click signal; matches a real press
-        pcall(function() firesignal(btn.MouseButton1Click) end)
-        pcall(function() firesignal(btn.Activated, {}) end)
+-- Fire the join exactly ONCE per period. ClassPeriod.joined is the gate;
+-- once true, no button click, no GoClicked, until a new period starts.
+-- This is what stops the "teleport spam" — the game teleports us to the
+-- classroom on the first fire; any subsequent fire risks bouncing us
+-- back to spawn or firing GoClicked with a stale class id.
+local function joinClassNow(className)
+    if ClassPeriod.joined then return end
+    if not isInClassPeriod() then
+        -- manual "Join Current Class Now" button path: if we don't have a
+        -- period tracked yet but an announcement is up, adopt it.
+        local tf = getAnnounceTeleportFrame()
+        if not (tf and tf.Visible) then return end
+        beginClassPeriod(className)
     end
-    -- always send the remote as a safety net (game accepts it idempotently
-    -- when a class is about to start; ignored otherwise)
+
+    ClassPeriod.joined = true
+    ClassPeriod.joinedAt = tick()
+    State.ClassesJoined = State.ClassesJoined + 1
+
+    local tf = getAnnounceTeleportFrame()
+    if tf then
+        local btn = tf:FindFirstChild("TeleportButton")
+        if btn and btn:IsA("GuiButton") then
+            pcall(function() firesignal(btn.MouseButton1Click) end)
+        end
+    end
     fireGoClicked()
 end
 
@@ -285,43 +357,58 @@ local function bindAutoJoin()
     if autoJoinBound then return end
     autoJoinBound = true
 
-    -- watcher: polls AnnouncementFrame.AnnouncementSlide.Container.TeleportFrame
-    -- for visibility. This dodges the fact that the frame is destroyed/rebuilt
-    -- across classes (so :GetPropertyChangedSignal doesn't survive).
-    local lastVisible = false
-    newLoop("autojoin", 0.5, function()
-        if not State.AutoJoinClass then lastVisible = false; return end
-        local tf = getAnnounceTeleportFrame()
-        if not tf then return end
-        local vis = tf.Visible
-        if vis and not lastVisible then
-            task.wait(0.4)
-            joinClassNow()
-        end
-        lastVisible = vis
-    end)
-
-    -- also listen for the scheduler transition signals — cheap, per-class fire
     if RH4ScheduleRemote then
-        local trans = RH4ScheduleRemote:FindFirstChild("Transition")
-        if trans then
-            track(trans.OnClientEvent:Connect(function(...)
-                if State.AutoJoinClass then
-                    task.wait(0.8)
-                    joinClassNow()
-                end
-            end))
-        end
+        -- SetClassName is the canonical class-period start signal. We
+        -- always open a fresh period on it (even with AutoJoin off) so
+        -- the farm-pause behavior stays consistent.
         local cn = RH4ScheduleRemote:FindFirstChild("SetClassName")
         if cn then
-            track(cn.OnClientEvent:Connect(function(...)
-                if State.AutoJoinClass then
-                    task.wait(0.5)
-                    joinClassNow()
+            track(cn.OnClientEvent:Connect(function(className)
+                -- if there was a running period, close it — the server just
+                -- moved us onto a new class.
+                if ClassPeriod.active then endClassPeriod() end
+
+                -- an empty name means "no class right now" — respect it.
+                if type(className) ~= "string" or className == "" then
+                    return
                 end
+
+                beginClassPeriod(className)
+
+                if not State.AutoJoinClass then return end
+                task.wait(0.6)
+                if not isInClassPeriod() then return end
+                if ClassPeriod.joined then return end
+                joinClassNow(className)
             end))
         end
+
+        -- Look for a class-end signal by name so the farm can resume
+        -- immediately instead of waiting for maxDuration.
+        for _, sub in ipairs(RH4ScheduleRemote:GetChildren()) do
+            if sub:IsA("RemoteEvent") then
+                local n = sub.Name:lower()
+                if n:find("classend") or n:find("classover")
+                   or n:find("endclass") or n:find("classfinish") then
+                    track(sub.OnClientEvent:Connect(function() endClassPeriod() end))
+                end
+            end
+        end
     end
+
+    -- Fallback: catch the announcement UI if SetClassName was missed
+    -- (e.g. joined server mid-announcement). Never re-fires within a
+    -- period thanks to the ClassPeriod.joined gate.
+    newLoop("autojoin", 1.5, function()
+        if not State.AutoJoinClass then return end
+        if ClassPeriod.joined then return end
+        local tf = getAnnounceTeleportFrame()
+        if not tf or not tf.Visible then return end
+        if not ClassPeriod.active then
+            beginClassPeriod("fallback-" .. ClassPeriod.id + 1)
+        end
+        joinClassNow(ClassPeriod.name)
+    end)
 end
 
 local function setGameAutoJoinPref(pref)
@@ -345,108 +432,273 @@ end
 -- appears when you're actually in the classroom. We hook the ones that we
 -- can safely automate without moving diamonds or breaching the geometry AC.
 ------------------------------------------------------------------------
-local ClassHandlers = {}
-
--- Stamping (Home Ec) — StampingMinigameRemote:FireServer("Stamp", score)
-ClassHandlers.Stamping = function()
-    local server = Workspace:FindFirstChild("StampingMinigame") or Workspace:FindFirstChild("StampingMinigameServer")
-    if not server then return end
-    local remote = server:FindFirstChild("StampingMinigameRemote", true)
-    if not remote then return end
-    pcall(function() remote:FireServer("Stamp", 100) end)
+-- humanized short delay so we don't fire on the same frame the server sent.
+-- Tuned tight: RH class minigames typically have short input windows and
+-- a delayed response caps your score below max. 20-60ms is well inside
+-- any reasonable "human" ceiling and safely above per-frame anti-cheat
+-- rate limits.
+local function humanDelay(loMs, hiMs)
+    task.wait(math.random(loMs or 20, hiMs or 60) / 1000)
 end
 
--- Flight (Airborne / Flight class) — FlightMinigameRemote:FireServer("GetRing", ringId)
-ClassHandlers.Flight = function()
-    local remote = Workspace:FindFirstChild("FlightMinigameRemote", true)
-        or ReplicatedStorage:FindFirstChild("FlightMinigameRemote", true)
-    if not remote then return end
-    local ringFolder = Workspace:FindFirstChild("FlightRings") or Workspace:FindFirstChild("Rings", true)
-    if not ringFolder then return end
-    for _, r in ipairs(ringFolder:GetChildren()) do
-        if r:IsA("BasePart") and r.Transparency < 0.9 then
-            pcall(function() remote:FireServer("GetRing", r.Name) end)
-            task.wait(0.05)
+-- Only run a minigame hook if we're actually in an active class period
+-- AND the user has toggled autoplay on. Prevents accidental fires when
+-- a stale server event lands after the class window.
+local function minigameGate()
+    if not State.AutoClassMinigame then return false end
+    if not isInClassPeriod() then return false end
+    return true
+end
+
+-- one-shot install: hook each class's server-to-client event and echo back
+-- the max-score / collect response. All hooks are gated by
+-- State.AutoClassMinigame so the toggle disables them at runtime.
+local classHooksInstalled = false
+local function installClassAutoplayHooks()
+    if classHooksInstalled then return end
+    classHooksInstalled = true
+
+    -- ================== TELESCOPE ==================
+    -- server sends {"ShootingStar", id, ...} / {"RainbowStar", id, ...} / {"UFO", id, ...}
+    -- client replies "CollectShootingStar" / "CollectRainbowStar" / "CollectUFO"
+    -- with the same id. Every miss is 1 diamond dropped, so we reply on the
+    -- next frame — no random delay.
+    local tel = ReplicatedStorage:FindFirstChild("TelescopeGameRemote")
+    if tel and tel:IsA("RemoteEvent") then
+        track(tel.OnClientEvent:Connect(function(action, ...)
+            if not minigameGate() then return end
+            if type(action) ~= "string" then return end
+            local args = {...}
+            local reply
+            local a = action:lower()
+            if a:find("shooting") or a == "star" then reply = "CollectShootingStar"
+            elseif a:find("rainbow") then             reply = "CollectRainbowStar"
+            elseif a:find("ufo") then                 reply = "CollectUFO"
+            elseif a:find("meteor") then              reply = "CollectMeteor"
+            end
+            if reply then
+                RunService.Heartbeat:Wait()
+                pcall(function() tel:FireServer(reply, unpack(args)) end)
+            end
+        end))
+    end
+
+    -- ================== COMPUTER ==================
+    -- ComputerMinigameRemotes.Update sends CurrentWord; we type each letter.
+    -- One in-flight word at a time — if a new word arrives mid-type, cancel
+    -- the previous run so we don't type letters into the wrong word.
+    local cmg = ReplicatedStorage:FindFirstChild("ComputerMinigameRemotes")
+    if cmg then
+        local update = cmg:FindFirstChild("Update")
+        local letter = cmg:FindFirstChild("LetterTyped")
+        if update and letter then
+            local runToken = 0
+            track(update.OnClientEvent:Connect(function(...)
+                if not minigameGate() then return end
+                runToken = runToken + 1
+                local myToken = runToken
+                for _, v in ipairs({...}) do
+                    if type(v) == "string" and #v >= 2 and #v <= 30 and v:match("^[%a%-']+$") then
+                        for i = 1, #v do
+                            if runToken ~= myToken then return end
+                            if not minigameGate() then return end
+                            humanDelay(35, 75)
+                            pcall(function() letter:FireServer(string.sub(v, i, i)) end)
+                        end
+                        break
+                    end
+                end
+            end))
         end
     end
-end
 
--- Slide (Water slide relay) — GetCurrentMovement / RunMovement
-ClassHandlers.Slide = function()
-    -- passive: RH slides give diamonds just for finishing, walking works fine
-end
+    -- ================== STUDY HALL ==================
+    -- server sends the flashcard sequence; we mirror it back on the same event.
+    -- Sequence arrives as a table OR a comma-separated string OR a stream of
+    -- individual "Show" events with one item each. All three shapes captured.
+    local sh = ReplicatedStorage:FindFirstChild("StudyHallRemote")
+    if sh and sh:IsA("RemoteEvent") then
+        local lastSequence = {}
+        local capturing    = false
+        track(sh.OnClientEvent:Connect(function(...)
+            if not minigameGate() then return end
+            local args = {...}
+            local head = type(args[1]) == "string" and args[1]:lower() or nil
 
--- Secret Brick Door — MainCampusSecretEvents.Submit:FireServer
-ClassHandlers.SecretDoor = function()
-    local part = Workspace:FindFirstChild("SecretBrickDoor")
-    if not part then return end
-    local ev = ReplicatedStorage:FindFirstChild("MainCampusSecretEvents", true)
-    if ev and ev:FindFirstChild("Submit") then
-        pcall(function() ev.Submit:FireServer(true) end)
+            -- open a fresh capture buffer when the server signals "show"/"start"
+            if head and (head:find("start") or head:find("show") or head:find("begin") or head:find("sequence")) then
+                lastSequence = {}
+                capturing    = true
+            end
+
+            -- vacuum any table or scalar items into the buffer
+            for i, v in ipairs(args) do
+                if i > 1 or not head then
+                    if type(v) == "table" then
+                        for _, item in ipairs(v) do table.insert(lastSequence, item) end
+                    elseif type(v) == "string" and v ~= head and #v <= 40 then
+                        -- comma-separated → split
+                        if v:find(",") then
+                            for tok in v:gmatch("([^,]+)") do
+                                table.insert(lastSequence, tok:match("^%s*(.-)%s*$"))
+                            end
+                        elseif capturing then
+                            table.insert(lastSequence, v)
+                        end
+                    elseif type(v) == "number" or type(v) == "userdata" then
+                        if capturing then table.insert(lastSequence, v) end
+                    end
+                end
+            end
+
+            -- reply on input-time signals
+            if head and (head:find("answer") or head:find("input") or head:find("time") or head:find("go")) then
+                capturing = false
+                if #lastSequence == 0 then return end
+                task.wait(0.15)
+                for _, item in ipairs(lastSequence) do
+                    if not minigameGate() then break end
+                    humanDelay(40, 90)
+                    pcall(function() sh:FireServer("Answer", item) end)
+                end
+                lastSequence = {}
+            end
+        end))
     end
-end
 
--- Tool Bonus — some classes give bonus diamonds when you're holding the
--- matching tool (e.g. potions in potionology). Firing this idempotently is
--- accepted by the server; it verifies backpack contents itself.
-ClassHandlers.ToolBonus = function()
-    fireToolBonus()
-end
+    -- ================== POTIONOLOGY ==================
+    -- server sends the recipe (colors in order); we send the same order back.
+    -- Some builds use "Ingredient"/"Add" instead of "Pick" — try both.
+    local po = ReplicatedStorage:FindFirstChild("PotionologyClassRemote")
+        or ReplicatedStorage:FindFirstChild("PotionologyRemote")
+    if po and po:IsA("RemoteEvent") then
+        track(po.OnClientEvent:Connect(function(...)
+            if not minigameGate() then return end
+            local args = {...}
+            for _, v in ipairs(args) do
+                if type(v) == "table" and #v > 0 then
+                    task.wait(0.2)
+                    for _, color in ipairs(v) do
+                        if not minigameGate() then break end
+                        humanDelay(50, 110)
+                        pcall(function() po:FireServer("Pick", color) end)
+                    end
+                    break
+                end
+            end
+        end))
+    end
 
--- Study Hall — StudyHallRemote is a RemoteFunction that grades your session.
--- Invoking it with no args typically returns the current grade snapshot; the
--- server side pays out based on server-tracked read time.
-ClassHandlers.StudyHall = function()
-    local rem = ReplicatedStorage:FindFirstChild("StudyHallRemote")
-    if not rem then return end
-    pcall(function()
-        if rem:IsA("RemoteFunction") then rem:InvokeServer("GetGrade")
-        else rem:FireServer("GetGrade") end
-    end)
-end
+    -- ================== ENGLISH ==================
+    -- server sends question + options; the correct option is marked via
+    -- attribute, name, IsCorrect BoolValue child, or comes back as an
+    -- explicit "Answer"/"CorrectAnswer" arg on the event. We check each
+    -- source in that order.
+    local en = ReplicatedStorage:FindFirstChild("EnglishClassRemote")
+        or ReplicatedStorage:FindFirstChild("EnglishRemote")
+    if en and en:IsA("RemoteEvent") then
+        track(en.OnClientEvent:Connect(function(...)
+            if not minigameGate() then return end
+            local args = {...}
+            local declaredAnswer
+            for i, v in ipairs(args) do
+                if type(v) == "string" then
+                    local prev = args[i-1]
+                    if type(prev) == "string" then
+                        local p = prev:lower()
+                        if p:find("answer") or p == "correct" then
+                            declaredAnswer = v
+                            break
+                        end
+                    end
+                end
+            end
 
--- Telescope — grants a diamond bonus for "Rainbow Star" combo picks.
-ClassHandlers.Telescope = function()
-    local rem = ReplicatedStorage:FindFirstChild("TelescopeGameRemote")
-    if not rem then return end
-    pcall(function() rem:FireServer("GotRainbowStar") end)
-end
+            task.wait(0.15)  -- let UI populate
+            local pg = LP:FindFirstChild("PlayerGui")
+            local rh4 = pg and pg:FindFirstChild("RH4Classes")
+            local eng = rh4 and (rh4:FindFirstChild("EnglishClass")
+                            or rh4:FindFirstChild("English"))
+            local correctBtn
+            if eng then
+                for _, d in ipairs(eng:GetDescendants()) do
+                    if d:IsA("GuiButton") and d.Visible then
+                        local isCorrect = false
+                        local n = d.Name:lower()
+                        if n:find("correct") then isCorrect = true end
+                        if declaredAnswer and (
+                              n == declaredAnswer:lower()
+                              or (d:IsA("TextButton") and d.Text and d.Text:lower() == declaredAnswer:lower())
+                           ) then
+                            isCorrect = true
+                        end
+                        local ok, attr = pcall(function() return d:GetAttribute("Correct") end)
+                        if ok and attr then isCorrect = true end
+                        local ic = d:FindFirstChild("IsCorrect")
+                        if ic and ic:IsA("BoolValue") and ic.Value then isCorrect = true end
+                        if isCorrect then correctBtn = d; break end
+                    end
+                end
+            end
+            if correctBtn then
+                humanDelay(60, 140)
+                pcall(function() firesignal(correctBtn.MouseButton1Click) end)
+                pcall(function() en:FireServer("PickAnswer", correctBtn.Name) end)
+            elseif declaredAnswer then
+                humanDelay(60, 140)
+                pcall(function() en:FireServer("PickAnswer", declaredAnswer) end)
+            end
+        end))
+    end
 
--- Book Check quest — mirrors LostBooks pattern for the book-check period.
-ClassHandlers.BookCheck = function()
-    local folder = Workspace:FindFirstChild("BookCheckBooks") or Workspace:FindFirstChild("ActiveBookCheck")
-    if not folder then return end
-    local remote = ReplicatedStorage:FindFirstChild("BookCheckRemote", true)
-        or (Workspace:FindFirstChild("BookCheckServer") and Workspace.BookCheckServer:FindFirstChild("BookCheckRemote"))
-    if not remote then return end
-    for _, b in ipairs(folder:GetChildren()) do
-        if b:IsA("BasePart") then
-            pcall(function() remote:FireServer("Get", b.Name) end)
-            task.wait(0.15)
+    -- ================== DETENTION ==================
+    -- rhythm game: server fires "Beat" events; we mirror back "Beats" with
+    -- matching id on the next frame — anything slower shaves the score.
+    local det = ReplicatedStorage:FindFirstChild("DetentionRemote")
+        or ReplicatedStorage:FindFirstChild("DetentionClassRemote")
+    if det and det:IsA("RemoteEvent") then
+        track(det.OnClientEvent:Connect(function(action, ...)
+            if not minigameGate() then return end
+            if type(action) == "string" and action:lower():find("beat") then
+                RunService.Heartbeat:Wait()
+                pcall(function() det:FireServer("Beats", ...) end)
+            end
+        end))
+    end
+
+    -- ================== SCIENCE / CHEMISTRY ==================
+    -- Some campuses expose a ChemistryClassRemote for the beaker-mixing
+    -- sequence. Same pattern as Potionology: table sequence → mirror.
+    local chem = ReplicatedStorage:FindFirstChild("ChemistryClassRemote")
+        or ReplicatedStorage:FindFirstChild("ScienceClassRemote")
+    if chem and chem:IsA("RemoteEvent") then
+        track(chem.OnClientEvent:Connect(function(...)
+            if not minigameGate() then return end
+            for _, v in ipairs({...}) do
+                if type(v) == "table" and #v > 0 then
+                    task.wait(0.2)
+                    for _, item in ipairs(v) do
+                        if not minigameGate() then break end
+                        humanDelay(50, 110)
+                        pcall(function() chem:FireServer("Pick", item) end)
+                    end
+                    break
+                end
+            end
+        end))
+    end
+
+    -- ================== TOOL BONUS ==================
+    -- fire once per class start so we're auto-credited when equipped
+    if RH4ScheduleRemote then
+        local scn = RH4ScheduleRemote:FindFirstChild("SetClassName")
+        if scn then
+            track(scn.OnClientEvent:Connect(function()
+                if not State.AutoClassMinigame then return end
+                task.wait(2)
+                fireToolBonus()
+            end))
         end
-    end
-end
-
--- Attic key (bookshelf) — AtticKeyRemote:FireServer("Get", key)
-ClassHandlers.Attic = function()
-    local server = Workspace:FindFirstChild("ATTIC") and Workspace.ATTIC:FindFirstChild("AtticKeyServer")
-    if not server then return end
-    local remote = server:FindFirstChild("AtticKeyRemote")
-    if not remote then return end
-    local keys = Workspace:FindFirstChild("AtticKeys") or Workspace:FindFirstChild("ActiveAtticKeys")
-    if not keys then return end
-    for _, k in ipairs(keys:GetChildren()) do
-        if k:IsA("BasePart") then
-            pcall(function() remote:FireServer("Get", k.Name) end)
-            task.wait(0.15)
-        end
-    end
-end
-
-local function classMinigameTick()
-    if not State.AutoClassMinigame then return end
-    for _, handler in pairs(ClassHandlers) do
-        pcall(handler)
     end
 end
 
@@ -553,6 +805,8 @@ LeftBox:AddButton({
 
 local diamondLabel = RightBox:AddLabel("Diamonds this session: 0")
 local bookLabel    = RightBox:AddLabel("Books this session: 0")
+local classLabel   = RightBox:AddLabel("Classes joined: 0")
+local statusLabel  = RightBox:AddLabel("Status: idle")
 
 local function setLabel(lbl, text)
     if not lbl then return end
@@ -567,6 +821,13 @@ end
 newLoop("statsLabel", 0.5, function()
     setLabel(diamondLabel, "Diamonds this session: " .. State.DiamondsCollected)
     setLabel(bookLabel,    "Books this session: "    .. State.BooksCollected)
+    setLabel(classLabel,   "Classes joined: "        .. State.ClassesJoined)
+    if isInClassPeriod() then
+        local elapsed = math.floor(tick() - ClassPeriod.startedAt)
+        setLabel(statusLabel, ("Status: in class '%s' (%ds) — farm paused"):format(tostring(ClassPeriod.name), elapsed))
+    else
+        setLabel(statusLabel, "Status: idle")
+    end
 end)
 
 -- Classes tab ------------------------------------------------------------
@@ -598,24 +859,36 @@ ClassBoxL:AddButton({
 })
 
 ClassBoxL:AddToggle("AutoClassMinigame", {
-    Text = "Auto-play Class Minigames",
+    Text = "Auto-play Class Minigames (max grade)",
     Default = false,
-    Tooltip = "Best-effort automation: Stamping, Flight rings, Secret Brick Door, Attic Keys, Study Hall grade, Telescope combo, Book Check, plus per-class Tool Bonus fires.",
+    Tooltip = "Event-hook autoplay tuned to reply on the next frame: Telescope, Computer, Study Hall, Potionology, English, Detention, Chemistry, plus Tool Bonus on class start. Every hook is gated by the class-period tracker so stale events after class-end are ignored.",
 }):OnChanged(function(v)
     State.AutoClassMinigame = v
-    if v then
-        newLoop("classmini", 0.6, classMinigameTick)
-    else
-        killLoop("classmini")
-    end
 end)
 
-ClassBoxR:AddLabel("Auto-join fires when the class announcement popup appears.")
-ClassBoxR:AddLabel("The persistent button sets RH4ScheduleRemote.SetJoinPref = 'On'")
-ClassBoxR:AddLabel("(matches the schedule bell's toggle) so the game handles it.")
+ClassBoxL:AddToggle("PauseFarmDuringClass", {
+    Text = "Pause diamond/book farm during class",
+    Default = true,
+    Tooltip = "Freezes the diamond/book/return hop loops from the moment the class join fires until the class ends. Prevents the character being yanked out of the classroom mid-minigame (which was previously causing the teleport-spam behavior).",
+}):OnChanged(function(v)
+    State.PauseFarmDuringClass = v
+end)
+
+ClassBoxL:AddButton({
+    Text = "Force End Class Period",
+    Func = function()
+        endClassPeriod()
+        Library:Notify("Class period cleared — farm resumes")
+    end,
+})
+
+ClassBoxR:AddLabel("Auto-join fires ONCE per class period on the SetClassName event.")
+ClassBoxR:AddLabel("A fallback catches the announcement UI if SetClassName was missed.")
+ClassBoxR:AddLabel("Persistent button sets RH4ScheduleRemote.SetJoinPref = 'On'.")
 ClassBoxR:AddDivider()
-ClassBoxR:AddLabel("Diamonds/Books cap per period is server-enforced (~10 diamonds).")
-ClassBoxR:AddLabel("Fountain wish (dorm): manual — story cutscene has edge cases.")
+ClassBoxR:AddLabel("Farm pauses from join → class-end (or 6 min cap).")
+ClassBoxR:AddLabel("Minigame hooks reply next-frame for max grade.")
+ClassBoxR:AddLabel("Diamonds/Books cap per period is server-enforced.")
 
 -- Utility tab ------------------------------------------------------------
 local UtilL = Tabs.Utility:AddLeftGroupbox("Movement")
@@ -720,6 +993,7 @@ end)
 -- kick off character-scoped bindings
 ------------------------------------------------------------------------
 bindAutoJoin()
+installClassAutoplayHooks()
 bindCharacterMovement()
 bindInfiniteJump()
 bindAntiAFK()
